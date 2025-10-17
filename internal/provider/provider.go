@@ -256,6 +256,7 @@ func (p *CrowdStrikeProvider) Resources(ctx context.Context) []func() resource.R
 		contentupdatepolicy.NewContentUpdatePolicyPrecedenceResource,
 		sensorvisibilityexclusion.NewSensorVisibilityExclusionResource,
 		cloudposture.NewCloudPostureCustomRuleResource,
+		cloudcompliance.NewCloudComplianceCustomFrameworkResource,
 	}
 }
 
