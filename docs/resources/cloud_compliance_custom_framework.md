@@ -78,7 +78,7 @@ output "cloud_compliance_custom_framework" {
 ### Optional
 
 - `active` (Boolean) Whether the custom compliance framework is active. Defaults to false on create. Once set to true, cannot be changed back to false.
-- `sections` (Attributes Map) Map of sections within the framework. Key is the section name. Sections cannot exist without controls. (see [below for nested schema](#nestedatt--sections))
+- `sections` (Attributes Set) Sections within the framework. Sections cannot exist without controls. (see [below for nested schema](#nestedatt--sections))
 
 ### Read-Only
 
@@ -89,7 +89,12 @@ output "cloud_compliance_custom_framework" {
 
 Required:
 
-- `controls` (Attributes Map) Map of controls within the section. Key is the control name. (see [below for nested schema](#nestedatt--sections--controls))
+- `controls` (Attributes Set) Controls within the section. (see [below for nested schema](#nestedatt--sections--controls))
+- `name` (String) Name of the compliance framework section.
+
+Read-Only:
+
+- `id` (String) Identifier for the compliance framework section.
 
 <a id="nestedatt--sections--controls"></a>
 ### Nested Schema for `sections.controls`
@@ -97,6 +102,7 @@ Required:
 Required:
 
 - `description` (String) Description of the control.
+- `name` (String) Name of the compliance framework control.
 
 Optional:
 
@@ -104,7 +110,7 @@ Optional:
 
 Read-Only:
 
-- `id` (String) Identifier for the framework control.
+- `id` (String) Identifier for the compliance framework control.
 
 ## Import
 

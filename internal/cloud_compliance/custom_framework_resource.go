@@ -3,6 +3,7 @@ package cloudcompliance
 import (
 	"context"
 	"fmt"
+	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"strings"
 
 	"github.com/crowdstrike/gofalcon/falcon"
@@ -10,9 +11,7 @@ import (
 	"github.com/crowdstrike/gofalcon/falcon/client/cloud_policies"
 	"github.com/crowdstrike/gofalcon/falcon/models"
 	"github.com/crowdstrike/terraform-provider-crowdstrike/internal/utils"
-	"github.com/hashicorp/terraform-plugin-framework-validators/mapvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
-	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -31,20 +30,6 @@ const (
 	complianceControlsByFrameworkSectionFilter = "compliance_control_benchmark_name:'%s'+compliance_control_authority:'Custom'+compliance_control_section:'%s'"
 	complianceRulesByControlFilter             = "rule_compliance_benchmark:'%s'+rule_control_section:'%s'+rule_control_requirement:'%s'+rule_domain:'CSPM'+rule_subdomain:'IOM'"
 )
-
-var controlAttrTypes = map[string]attr.Type{
-	"id":          types.StringType,
-	"description": types.StringType,
-	"rules":       types.SetType{ElemType: types.StringType},
-}
-
-var sectionAttrTypes = map[string]attr.Type{
-	"controls": types.MapType{
-		ElemType: types.ObjectType{
-			AttrTypes: controlAttrTypes,
-		},
-	},
-}
 
 var (
 	_ resource.Resource                   = &cloudComplianceCustomFrameworkResource{}
@@ -72,22 +57,25 @@ type cloudComplianceCustomFrameworkResourceModel struct {
 	Name        types.String `tfsdk:"name"`
 	Description types.String `tfsdk:"description"`
 	Active      types.Bool   `tfsdk:"active"`
-	Sections    types.Map    `tfsdk:"sections"`
+	Sections    types.Set    `tfsdk:"sections"`
 }
 
 type SectionModel struct {
-	Controls types.Map `tfsdk:"controls"`
+	ID       types.String `tfsdk:"id"`
+	Name     types.String `tfsdk:"name"`
+	Controls types.Set    `tfsdk:"controls"`
 }
 
 type ControlModel struct {
 	ID          types.String `tfsdk:"id"`
+	Name        types.String `tfsdk:"name"`
 	Description types.String `tfsdk:"description"`
 	Rules       types.Set    `tfsdk:"rules"`
 }
 
 // wrap transforms API response values to their terraform model values.
 func (d *cloudComplianceCustomFrameworkResourceModel) wrap(
-	ctx context.Context,
+	_ context.Context,
 	framework *models.ApimodelsSecurityFramework,
 ) diag.Diagnostics {
 	var diags diag.Diagnostics
@@ -159,6 +147,9 @@ func (r *cloudComplianceCustomFrameworkResource) Schema(
 			"name": schema.StringAttribute{
 				Required:            true,
 				MarkdownDescription: "The name of the custom compliance framework.",
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
 			},
 			"description": schema.StringAttribute{
 				Required:            true,
@@ -173,27 +164,45 @@ func (r *cloudComplianceCustomFrameworkResource) Schema(
 				Default:             booldefault.StaticBool(false),
 				MarkdownDescription: "Whether the custom compliance framework is active. Defaults to false on create. Once set to true, cannot be changed back to false.",
 			},
-			"sections": schema.MapNestedAttribute{
+			"sections": schema.SetNestedAttribute{
 				Optional:            true,
-				MarkdownDescription: "Map of sections within the framework. Key is the section name. Sections cannot exist without controls.",
-				Validators: []validator.Map{
-					mapvalidator.KeysAre(stringvalidator.LengthAtLeast(1)),
-				},
+				MarkdownDescription: "Sections within the framework. Sections cannot exist without controls.",
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
-						"controls": schema.MapNestedAttribute{
+						"id": schema.StringAttribute{
+							Computed:            true,
+							MarkdownDescription: "Identifier for the compliance framework section.",
+							PlanModifiers: []planmodifier.String{
+								stringplanmodifier.UseStateForUnknown(),
+							},
+						},
+						"name": schema.StringAttribute{
 							Required:            true,
-							MarkdownDescription: "Map of controls within the section. Key is the control name.",
-							Validators: []validator.Map{
-								mapvalidator.KeysAre(stringvalidator.LengthAtLeast(1)),
+							MarkdownDescription: "Name of the compliance framework section.",
+							Validators: []validator.String{
+								stringvalidator.LengthAtLeast(1),
+							},
+						},
+						"controls": schema.SetNestedAttribute{
+							Required:            true,
+							MarkdownDescription: "Controls within the section.",
+							Validators: []validator.Set{
+								setvalidator.SizeAtLeast(1),
 							},
 							NestedObject: schema.NestedAttributeObject{
 								Attributes: map[string]schema.Attribute{
 									"id": schema.StringAttribute{
 										Computed:            true,
-										MarkdownDescription: "Identifier for the framework control.",
+										MarkdownDescription: "Identifier for the compliance framework control.",
 										PlanModifiers: []planmodifier.String{
 											stringplanmodifier.UseStateForUnknown(),
+										},
+									},
+									"name": schema.StringAttribute{
+										Required:            true,
+										MarkdownDescription: "Name of the compliance framework control.",
+										Validators: []validator.String{
+											stringvalidator.LengthAtLeast(1),
 										},
 									},
 									"description": schema.StringAttribute{
@@ -201,9 +210,6 @@ func (r *cloudComplianceCustomFrameworkResource) Schema(
 										MarkdownDescription: "Description of the control.",
 										Validators: []validator.String{
 											stringvalidator.LengthAtLeast(1),
-										},
-										PlanModifiers: []planmodifier.String{
-											stringplanmodifier.RequiresReplace(),
 										},
 									},
 									"rules": schema.SetAttribute{
@@ -261,16 +267,30 @@ func (r *cloudComplianceCustomFrameworkResource) Create(
 		return
 	}
 
+	// Declare sections variable for later use
+	var sectionsMap map[string]SectionModel
+
 	// Create controls and assign rules if sections are provided
-	var sections map[string]SectionModel
 	if !plan.Sections.IsNull() && !plan.Sections.IsUnknown() {
-		resp.Diagnostics.Append(plan.Sections.ElementsAs(ctx, &sections, false)...)
+		var diags diag.Diagnostics
+
+		sectionsMap, diags = convertTerraformSetToSectionsMap(ctx, plan.Sections)
+		resp.Diagnostics.Append(diags...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
 
+		// Generate deterministic UUIDs for sections during create operation
+		for sectionName, section := range sectionsMap {
+			if section.ID.IsNull() || section.ID.IsUnknown() {
+				deterministicID := generateDeterministicUUID(plan.Name.ValueString(), sectionName)
+				section.ID = types.StringValue(deterministicID)
+				sectionsMap[sectionName] = section
+			}
+		}
+
 		// Create controls for this framework
-		resp.Diagnostics.Append(r.createControlsForFramework(ctx, framework.UUID, sections)...)
+		resp.Diagnostics.Append(r.createControlsForFramework(ctx, framework.UUID, sectionsMap)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
@@ -283,13 +303,14 @@ func (r *cloudComplianceCustomFrameworkResource) Create(
 	}
 
 	// Read controls and sections data if sections were created
-	if !plan.Sections.IsNull() && !plan.Sections.IsUnknown() {
-		sectionsMap, sectionsDiags := r.readControlsForFramework(ctx, *framework)
+	if !plan.Sections.IsNull() && !plan.Sections.IsUnknown() && sectionsMap != nil {
+		// Convert the sections with generated IDs back to Terraform set
+		sectionsSet, sectionsDiags := convertSectionsMapToTerraformSet(ctx, sectionsMap)
 		resp.Diagnostics.Append(sectionsDiags...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		plan.Sections = sectionsMap
+		plan.Sections = sectionsSet
 	}
 
 	// Set state
@@ -346,7 +367,7 @@ func (r *cloudComplianceCustomFrameworkResource) Read(
 		return
 	}
 
-	sectionsMap, sectionsDiags := r.readControlsForFramework(ctx, *framework)
+	sectionsMap, sectionsDiags := r.readControlsForFramework(ctx, *framework, &state)
 	resp.Diagnostics.Append(sectionsDiags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -410,21 +431,21 @@ func (r *cloudComplianceCustomFrameworkResource) Update(
 	// Handle sections/controls/rules updates using differential approach
 	// This preserves existing control IDs and only creates/updates/deletes as needed
 	if !plan.Sections.IsNull() && !plan.Sections.IsUnknown() {
-		var planSections map[string]SectionModel
-		resp.Diagnostics.Append(plan.Sections.ElementsAs(ctx, &planSections, false)...)
+		planSections, planDiags := convertTerraformSetToSectionsMap(ctx, plan.Sections)
+		resp.Diagnostics.Append(planDiags...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
 
 		// Get current state sections to compare
-		var stateSections map[string]SectionModel
+		stateSections := make(map[string]SectionModel)
 		if !state.Sections.IsNull() && !state.Sections.IsUnknown() {
-			resp.Diagnostics.Append(state.Sections.ElementsAs(ctx, &stateSections, false)...)
+			var err diag.Diagnostics
+			stateSections, err = convertTerraformSetToSectionsMap(ctx, state.Sections)
+			resp.Diagnostics.Append(err...)
 			if resp.Diagnostics.HasError() {
 				return
 			}
-		} else {
-			stateSections = make(map[string]SectionModel)
 		}
 
 		// Update controls differentially
@@ -450,12 +471,12 @@ func (r *cloudComplianceCustomFrameworkResource) Update(
 
 	// Read back the controls to ensure state consistency only if sections are configured
 	if !plan.Sections.IsNull() && !plan.Sections.IsUnknown() {
-		sectionsMap, sectionsDiags := r.readControlsForFramework(ctx, *framework)
+		sectionsSet, sectionsDiags := r.readControlsForFramework(ctx, *framework, &state)
 		resp.Diagnostics.Append(sectionsDiags...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		plan.Sections = sectionsMap
+		plan.Sections = sectionsSet
 	}
 
 	// Set state
@@ -534,6 +555,38 @@ func (r *cloudComplianceCustomFrameworkResource) ValidateConfig(
 ) {
 	var config cloudComplianceCustomFrameworkResourceModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Skip validation if sections is null or unknown
+	if config.Sections.IsNull() || config.Sections.IsUnknown() {
+		return
+	}
+
+	// Validate that no sections are empty
+	sections, convertDiags := convertTerraformSetToSectionsMap(ctx, config.Sections)
+	resp.Diagnostics.Append(convertDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	for _, section := range sections {
+		controls, controlsDiags := convertTerraformSetToControlsMap(ctx, section.Controls)
+		resp.Diagnostics.Append(controlsDiags...)
+		if resp.Diagnostics.HasError() {
+			continue
+		}
+
+		if len(controls) == 0 {
+			sectionName := section.Name.ValueString()
+			resp.Diagnostics.AddAttributeError(
+				path.Root("sections"),
+				"Empty Section Not Allowed",
+				fmt.Sprintf("Section '%s' cannot be empty. Each section must contain at least one control.", sectionName),
+			)
+		}
+	}
 }
 
 // createControlsForFramework creates controls and assigns rules for a framework
@@ -545,17 +598,29 @@ func (r *cloudComplianceCustomFrameworkResource) createControlsForFramework(
 	diags := diag.Diagnostics{}
 
 	for sectionName, section := range sections {
-		var sectionControls map[string]ControlModel
-		diags.Append(section.Controls.ElementsAs(ctx, &sectionControls, false)...)
+		sectionControls, convertDiags := convertTerraformSetToControlsMap(ctx, section.Controls)
+		diags.Append(convertDiags...)
 		if diags.HasError() {
 			continue
 		}
 
+		newControlsMap := make(map[string]ControlModel)
 		for controlName, control := range sectionControls {
-			_, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionName, controlName, control)
+			createdControl, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionName, controlName, control)
 			diags.Append(createDiags...)
 			if diags.HasError() {
 				continue
+			}
+			newControlsMap[controlName] = createdControl
+		}
+
+		// Convert updated controls back to Terraform set and update the section
+		if len(newControlsMap) > 0 {
+			newControlsSet, controlsSetDiags := convertControlsMapToTerraformSet(ctx, newControlsMap)
+			diags.Append(controlsSetDiags...)
+			if !diags.HasError() {
+				section.Controls = newControlsSet
+				sections[sectionName] = section // Update the section in the map
 			}
 		}
 	}
@@ -622,48 +687,50 @@ func (r *cloudComplianceCustomFrameworkResource) createSingleControlAndReturn(
 	// Return the control model with the new ID
 	return ControlModel{
 		ID:          types.StringValue(*controlID),
+		Name:        types.StringValue(controlName),
 		Description: control.Description,
 		Rules:       control.Rules,
 	}, diags
 }
 
-// readControlsForFramework reads controls and rules for a framework and returns sections as terraform map
+// readControlsForFramework reads controls and rules for a framework and returns sections as terraform set
 func (r *cloudComplianceCustomFrameworkResource) readControlsForFramework(
 	ctx context.Context,
 	framework models.ApimodelsSecurityFramework,
-) (types.Map, diag.Diagnostics) {
+	existingState *cloudComplianceCustomFrameworkResourceModel,
+) (types.Set, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	frameworkName := *framework.Name
 
 	controlIDs, queryDiags := r.queryFrameworkControls(ctx, frameworkName)
 	diags.Append(queryDiags...)
 	if diags.HasError() {
-		return types.MapNull(types.ObjectType{}), diags
+		return types.SetNull(types.ObjectType{AttrTypes: sectionAttrTypes}), diags
 	}
 
-	// If no controls found, return empty sections map
+	// If no controls found, return empty sections set
 	if len(controlIDs) == 0 {
-		emptyMap, mapDiags := convertSectionsMapToTerraformMap(ctx, map[string]SectionModel{})
-		diags.Append(mapDiags...)
-		return emptyMap, diags
+		emptySet, setDiags := convertSectionsMapToTerraformSet(ctx, map[string]SectionModel{})
+		diags.Append(setDiags...)
+		return emptySet, diags
 	}
 
 	// Get detailed control information
 	apiControls, apiControlDiags := r.getControlDetails(ctx, controlIDs)
 	diags.Append(apiControlDiags...)
 	if diags.HasError() {
-		return types.MapNull(types.ObjectType{}), diags
+		return types.SetNull(types.ObjectType{AttrTypes: sectionAttrTypes}), diags
 	}
 
 	// Organize controls by section
-	sectionMap := make(map[string]map[string]ControlModel)
+	sectionToControlsMap := make(map[string]map[string]ControlModel)
 	for _, apiControl := range apiControls {
 		sectionName := apiControl.SectionName
 		controlName := *apiControl.Name
 
 		// Initialize section if it does not exist
-		if _, exists := sectionMap[sectionName]; !exists {
-			sectionMap[sectionName] = make(map[string]ControlModel)
+		if _, exists := sectionToControlsMap[sectionName]; !exists {
+			sectionToControlsMap[sectionName] = make(map[string]ControlModel)
 		}
 
 		controlModel, controlDiags := r.readControlWithRules(ctx, apiControl, frameworkName)
@@ -672,27 +739,48 @@ func (r *cloudComplianceCustomFrameworkResource) readControlsForFramework(
 			continue
 		}
 
-		sectionMap[sectionName][controlName] = controlModel
+		sectionToControlsMap[sectionName][controlName] = controlModel
 	}
 
-	// Convert sections and controls to terraform maps
-	sections := make(map[string]SectionModel)
-	for sectionName, controls := range sectionMap {
-		controlsMap, controlsMapDiags := convertControlsMapToTerraformMap(ctx, controls)
-		diags.Append(controlsMapDiags...)
+	// Get existing sections from state to preserve section IDs
+	var existingSections map[string]SectionModel
+	if existingState != nil && !existingState.Sections.IsNull() && !existingState.Sections.IsUnknown() {
+		existingSections, _ = convertTerraformSetToSectionsMap(ctx, existingState.Sections)
+	} else {
+		existingSections = make(map[string]SectionModel)
+	}
+
+	// Convert sections and controls to terraform set
+	sectionsMap := make(map[string]SectionModel)
+	for sectionName, controls := range sectionToControlsMap {
+		controlsSet, controlsSetDiags := convertControlsMapToTerraformSet(ctx, controls)
+		diags.Append(controlsSetDiags...)
 		if diags.HasError() {
 			continue
 		}
 
-		sections[sectionName] = SectionModel{
-			Controls: controlsMap,
+		// Preserve existing section ID or generate a deterministic one based on framework+section
+		var sectionID types.String
+		if existingSection, exists := existingSections[sectionName]; exists && !existingSection.ID.IsNull() && !existingSection.ID.IsUnknown() {
+			sectionID = existingSection.ID
+		} else {
+			// Generate deterministic UUID based on framework name and section name
+			// This ensures the same section always gets the same ID
+			deterministicID := generateDeterministicUUID(frameworkName, sectionName)
+			sectionID = types.StringValue(deterministicID)
+		}
+
+		sectionsMap[sectionName] = SectionModel{
+			ID:       sectionID,
+			Name:     types.StringValue(sectionName),
+			Controls: controlsSet,
 		}
 	}
 
-	sectionsMap, sectionsMapDiags := convertSectionsMapToTerraformMap(ctx, sections)
-	diags.Append(sectionsMapDiags...)
+	sectionsSet, sectionsSetDiags := convertSectionsMapToTerraformSet(ctx, sectionsMap)
+	diags.Append(sectionsSetDiags...)
 
-	return sectionsMap, diags
+	return sectionsSet, diags
 }
 
 func (r *cloudComplianceCustomFrameworkResource) queryFrameworkControls(
@@ -786,6 +874,7 @@ func (r *cloudComplianceCustomFrameworkResource) readControlWithRules(
 
 	return ControlModel{
 		ID:          types.StringValue(*control.UUID),
+		Name:        types.StringValue(*control.Name),
 		Description: types.StringValue(control.Description),
 		Rules:       rulesSet,
 	}, diags
@@ -797,32 +886,32 @@ func (r *cloudComplianceCustomFrameworkResource) updateControlsForFramework(
 	frameworkID string,
 	stateSections map[string]SectionModel,
 	planSections map[string]SectionModel,
-) (types.Map, diag.Diagnostics) {
+) (types.Set, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
 	// Build existing controls map for lookup
 	existingControls, buildDiags := r.buildExistingControlsMap(ctx, stateSections)
 	diags.Append(buildDiags...)
 	if diags.HasError() {
-		return types.MapNull(types.ObjectType{}), diags
+		return types.SetNull(types.ObjectType{AttrTypes: sectionAttrTypes}), diags
 	}
 
 	// Process control updates
 	updatedSections, processDiags := r.processControlUpdates(ctx, frameworkID, existingControls, planSections)
 	diags.Append(processDiags...)
 	if diags.HasError() {
-		return types.MapNull(types.ObjectType{}), diags
+		return types.SetNull(types.ObjectType{AttrTypes: sectionAttrTypes}), diags
 	}
 
 	// Delete controls that no longer exist in plan
 	deleteDiags := r.deleteRemovedControls(ctx, existingControls, planSections)
 	diags.Append(deleteDiags...)
 
-	// Convert to Terraform map
-	sectionsMap, mapDiags := convertSectionsMapToTerraformMap(ctx, updatedSections)
-	diags.Append(mapDiags...)
+	// Convert to Terraform set
+	sectionsSet, setDiags := convertSectionsMapToTerraformSet(ctx, updatedSections)
+	diags.Append(setDiags...)
 
-	return sectionsMap, diags
+	return sectionsSet, diags
 }
 
 // Helper functions for updateControlsForFramework
@@ -834,8 +923,8 @@ func (r *cloudComplianceCustomFrameworkResource) buildExistingControlsMap(
 	existingControls := make(map[string]map[string]ControlModel)
 
 	for sectionName, section := range stateSections {
-		var sectionControls map[string]ControlModel
-		diags.Append(section.Controls.ElementsAs(ctx, &sectionControls, false)...)
+		sectionControls, convertDiags := convertTerraformSetToControlsMap(ctx, section.Controls)
+		diags.Append(convertDiags...)
 		if diags.HasError() {
 			continue
 		}
@@ -854,10 +943,13 @@ func (r *cloudComplianceCustomFrameworkResource) processControlUpdates(
 	var diags diag.Diagnostics
 	updatedSections := make(map[string]SectionModel)
 
+	// Build a map of all existing control IDs for efficient lookup
+	existingControlsByID := r.buildControlsByIDMap(existingControls)
+
 	// Process each section in the plan
 	for sectionName, planSection := range planSections {
-		var planControls map[string]ControlModel
-		diags.Append(planSection.Controls.ElementsAs(ctx, &planControls, false)...)
+		planControls, convertDiags := convertTerraformSetToControlsMap(ctx, planSection.Controls)
+		diags.Append(convertDiags...)
 		if diags.HasError() {
 			continue
 		}
@@ -866,56 +958,97 @@ func (r *cloudComplianceCustomFrameworkResource) processControlUpdates(
 
 		// Process each control in this section
 		for controlName, planControl := range planControls {
-			// Check if control exists in current state
-			if existingSection, sectionExists := existingControls[sectionName]; sectionExists {
-				if existingControl, controlExists := existingSection[controlName]; controlExists {
-					updateDiags := r.updateExistingControl(ctx, existingControl, planControl, controlName, sectionName)
+			tflog.Debug(ctx, "PROCESS: Processing control", map[string]any{
+				"planSectionName":        sectionName,
+				"controlName":            controlName,
+				"planControlID":          planControl.ID.ValueString(),
+				"planControlIDIsNull":    planControl.ID.IsNull(),
+				"planControlIDIsUnknown": planControl.ID.IsUnknown(),
+			})
+
+			// Check if plan control has an existing ID (from state)
+			if !planControl.ID.IsNull() && !planControl.ID.IsUnknown() {
+				controlID := planControl.ID.ValueString()
+				tflog.Debug(ctx, "PROCESS: Plan control has existing ID", map[string]any{
+					"controlID": controlID,
+				})
+
+				if existingControl, exists := existingControlsByID[controlID]; exists {
+					tflog.Debug(ctx, "PROCESS: Found existing control by ID", map[string]any{
+						"controlID":   controlID,
+						"controlName": controlName,
+					})
+					// Update existing control (handles renames and moves between sections)
+					updateDiags := r.updateExistingControl(
+						ctx, existingControl, planControl, controlName, sectionName,
+					)
 					diags.Append(updateDiags...)
 
-					// Update rules, if necessary
-					if existingControl.Rules.Equal(planControl.Rules) {
-						controlID := existingControl.ID.ValueString()
+					// Update rules if necessary
+					if !existingControl.Rules.Equal(planControl.Rules) {
 						rulesDiags := r.updateControlRules(ctx, controlID, planControl, controlName)
 						diags.Append(rulesDiags...)
 					}
 
 					// Use existing control with updated data
 					updatedControls[controlName] = ControlModel{
-						ID:          existingControl.ID,      // Keep existing ID
-						Description: planControl.Description, // Use plan description
-						Rules:       planControl.Rules,       // Use plan rules
+						ID:          existingControl.ID,             // Keep existing ID
+						Name:        types.StringValue(controlName), // Use control name
+						Description: planControl.Description,        // Use plan description
+						Rules:       planControl.Rules,              // Use plan rules
 					}
-				} else {
-					// Control doesn't exist in this section, create it
-					createdControl, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionName, controlName, planControl)
-					diags.Append(createDiags...)
-					if !diags.HasError() {
-						updatedControls[controlName] = createdControl
-					}
+					continue
 				}
 			} else {
-				// Section doesn't exist, create the control
-				createdControl, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionName, controlName, planControl)
-				diags.Append(createDiags...)
-				if !diags.HasError() {
-					updatedControls[controlName] = createdControl
-				}
+				tflog.Debug(ctx, "PROCESS: Plan control has no existing ID - will try to find existing control or create new", map[string]any{
+					"controlName": controlName,
+					"sectionName": sectionName,
+				})
+			}
+
+			// No existing control found, create new one
+			tflog.Debug(ctx, "PROCESS: Creating new control", map[string]any{
+				"controlName": controlName,
+				"sectionName": sectionName,
+			})
+			createdControl, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionName, controlName, planControl)
+			diags.Append(createDiags...)
+			if !diags.HasError() {
+				updatedControls[controlName] = createdControl
 			}
 		}
 
-		// Convert to Terraform map
-		controlsMap, controlsMapDiags := convertControlsMapToTerraformMap(ctx, updatedControls)
-		diags.Append(controlsMapDiags...)
+		// Convert to Terraform set
+		controlsSet, controlsSetDiags := convertControlsMapToTerraformSet(ctx, updatedControls)
+		diags.Append(controlsSetDiags...)
 		if diags.HasError() {
 			continue
 		}
 
 		updatedSections[sectionName] = SectionModel{
-			Controls: controlsMap,
+			Name:     types.StringValue(sectionName),
+			Controls: controlsSet,
 		}
 	}
 
 	return updatedSections, diags
+}
+
+// buildControlsByIDMap creates a flat map of all existing controls indexed by ID
+func (r *cloudComplianceCustomFrameworkResource) buildControlsByIDMap(
+	existingControls map[string]map[string]ControlModel,
+) map[string]ControlModel {
+	controlsByID := make(map[string]ControlModel)
+
+	for _, sectionControls := range existingControls {
+		for _, control := range sectionControls {
+			if !control.ID.IsNull() && !control.ID.IsUnknown() {
+				controlsByID[control.ID.ValueString()] = control
+			}
+		}
+	}
+
+	return controlsByID
 }
 
 func (r *cloudComplianceCustomFrameworkResource) updateExistingControl(
@@ -925,24 +1058,21 @@ func (r *cloudComplianceCustomFrameworkResource) updateExistingControl(
 ) diag.Diagnostics {
 	var diags diag.Diagnostics
 
-	// Update control description if changed
-	if shouldUpdateControlDescription(existingControl.Description.ValueString(), planControl.Description.ValueString()) {
-		controlID := existingControl.ID.ValueString()
-		controlDesc := planControl.Description.ValueString()
-		updateReq := &models.CommonUpdateComplianceControlRequest{
-			Name:        &controlName,
-			Description: &controlDesc,
-		}
+	controlID := existingControl.ID.ValueString()
+	//controlDesc := planControl.Description.ValueString()
+	updateReq := &models.CommonUpdateComplianceControlRequest{
+		Name: &controlName,
+		//Description: &controlDesc,
+	}
 
-		updateParams := cloud_policies.NewUpdateComplianceControlParamsWithContext(ctx).
-			WithIds(controlID).
-			WithBody(updateReq)
+	updateParams := cloud_policies.NewUpdateComplianceControlParamsWithContext(ctx).
+		WithIds(controlID).
+		WithBody(updateReq)
 
-		_, err := r.client.CloudPolicies.UpdateComplianceControl(updateParams)
-		if err != nil {
-			diags.AddError(errorUpdatingControl,
-				fmt.Sprintf("Failed to update control %s in section %s: %s", controlName, sectionName, falcon.ErrorExplain(err)))
-		}
+	_, err := r.client.CloudPolicies.UpdateComplianceControl(updateParams)
+	if err != nil {
+		diags.AddError(errorUpdatingControl,
+			fmt.Sprintf("Failed to update control %s in section %s: %s", controlName, sectionName, falcon.ErrorExplain(err)))
 	}
 
 	return diags
@@ -995,8 +1125,8 @@ func (r *cloudComplianceCustomFrameworkResource) deleteRemovedControls(
 			// Check if this control still exists in the plan
 			controlStillExists := false
 			if _, sectionExists := planSections[stateSectionName]; sectionExists {
-				var planControls map[string]ControlModel
-				diags.Append(planSections[stateSectionName].Controls.ElementsAs(ctx, &planControls, false)...)
+				planControls, convertDiags := convertTerraformSetToControlsMap(ctx, planSections[stateSectionName].Controls)
+				diags.Append(convertDiags...)
 				if !diags.HasError() {
 					if _, controlExists := planControls[stateControlName]; controlExists {
 						controlStillExists = true
@@ -1020,7 +1150,61 @@ func (r *cloudComplianceCustomFrameworkResource) deleteRemovedControls(
 	return diags
 }
 
-// deleteControlsForFramework deletes all controls for a framework
+// detectSectionRenames identifies section renames by comparing section IDs with different names
+func (r *cloudComplianceCustomFrameworkResource) detectSectionRenames(
+	ctx context.Context,
+	stateSections, planSections map[string]SectionModel,
+) map[string]string {
+	renames := make(map[string]string)
+
+	// Check for sections with same ID but different names
+	for sectionID, planSection := range planSections {
+		if stateSection, exists := stateSections[sectionID]; exists {
+			stateName := stateSection.Name.ValueString()
+			planName := planSection.Name.ValueString()
+
+			// If same ID but different names, it's a rename
+			if stateName != planName {
+				renames[stateName] = planName
+			}
+		}
+	}
+
+	return renames
+}
+
+// handleSectionRenames detects and processes section renames using section IDs
+func (r *cloudComplianceCustomFrameworkResource) handleSectionRenames(
+	ctx context.Context,
+	frameworkID string,
+	stateSections map[string]SectionModel,
+	planSections map[string]SectionModel,
+) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	// Use private state to detect renames
+	sectionRenames := r.detectSectionRenames(ctx, stateSections, planSections)
+
+	// Execute section renames using the special API
+	for oldSectionName, newSectionName := range sectionRenames {
+		tflog.Info(ctx, "Renaming section", map[string]any{
+			"frameworkID":    frameworkID,
+			"oldSectionName": oldSectionName,
+			"newSectionName": newSectionName,
+		})
+
+		params := buildRenameSectionParams(ctx, frameworkID, oldSectionName, newSectionName)
+		_, err := r.client.CloudPolicies.RenameSectionComplianceFramework(params)
+		if err != nil {
+			diags.AddError(
+				"Error Renaming Section",
+				fmt.Sprintf("Failed to rename section from '%s' to '%s': %s", oldSectionName, newSectionName, falcon.ErrorExplain(err)),
+			)
+		}
+	}
+
+	return diags
+}
 func (r *cloudComplianceCustomFrameworkResource) deleteControlsForFramework(
 	ctx context.Context,
 	frameworkName string,
@@ -1059,8 +1243,4 @@ func validateActiveFieldTransition(currentActive, newActive types.Bool) diag.Dia
 	}
 
 	return diags
-}
-
-func shouldUpdateControlDescription(existing, planned string) bool {
-	return existing != planned
 }

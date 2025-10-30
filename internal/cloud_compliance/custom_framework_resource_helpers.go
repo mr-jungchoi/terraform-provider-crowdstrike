@@ -2,6 +2,8 @@ package cloudcompliance
 
 import (
 	"context"
+	"fmt"
+	"github.com/google/uuid"
 
 	"github.com/crowdstrike/gofalcon/falcon/client/cloud_policies"
 	"github.com/crowdstrike/gofalcon/falcon/models"
@@ -9,6 +11,32 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
+
+var controlAttrTypes = map[string]attr.Type{
+	"id":          types.StringType,
+	"name":        types.StringType,
+	"description": types.StringType,
+	"rules":       types.SetType{ElemType: types.StringType},
+}
+
+var sectionAttrTypes = map[string]attr.Type{
+	"id":   types.StringType,
+	"name": types.StringType,
+	"controls": types.SetType{
+		ElemType: types.ObjectType{
+			AttrTypes: controlAttrTypes,
+		},
+	},
+}
+
+var crowdStrikeComplianceNamespace = uuid.MustParse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+// generateDeterministicUUID creates a consistent UUID based on framework and section names using UUID v5
+func generateDeterministicUUID(frameworkName, sectionName string) string {
+	// Create deterministic UUID v5 based on framework:section
+	deterministicUUID := uuid.NewSHA1(crowdStrikeComplianceNamespace, []byte(fmt.Sprintf("%s:%s", frameworkName, sectionName)))
+	return deterministicUUID.String()
+}
 
 // API parameter building utilities
 
@@ -65,6 +93,21 @@ func buildCreateControlParams(
 	return params
 }
 
+func buildRenameSectionParams(
+	ctx context.Context,
+	frameworkID, oldSectionName, newSectionName string,
+) *cloud_policies.RenameSectionComplianceFrameworkParams {
+	renameReq := &models.CommonRenameSectionRequest{
+		SectionName: &newSectionName,
+	}
+
+	params := cloud_policies.NewRenameSectionComplianceFrameworkParamsWithContext(ctx)
+	params.SetIds(frameworkID)
+	params.SetSectionName(oldSectionName)
+	params.SetBody(renameReq)
+	return params
+}
+
 // Terraform type conversion utilities
 
 func convertRulesToTerraformSet(rules []string) (types.Set, diag.Diagnostics) {
@@ -81,46 +124,110 @@ func convertRulesToTerraformSet(rules []string) (types.Set, diag.Diagnostics) {
 	return rulesSet, diags
 }
 
-func convertControlsMapToTerraformMap(ctx context.Context, controls map[string]ControlModel) (types.Map, diag.Diagnostics) {
+func convertControlsMapToTerraformSet(ctx context.Context, controlsMap map[string]ControlModel) (types.Set, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
-	controlsAttrValue := make(map[string]attr.Value)
-	for controlName, control := range controls {
-		controlValue, controlDiags := types.ObjectValueFrom(ctx, controlAttrTypes, control)
+	controlsAttrValue := make([]attr.Value, 0, len(controlsMap))
+	for _, control := range controlsMap {
+		// Add name to the control model for the set representation
+		controlWithName := ControlModel{
+			ID:          control.ID,
+			Name:        control.Name,
+			Description: control.Description,
+			Rules:       control.Rules,
+		}
+
+		controlValue, controlDiags := types.ObjectValueFrom(ctx, controlAttrTypes, controlWithName)
 		diags.Append(controlDiags...)
 		if diags.HasError() {
 			continue
 		}
-		controlsAttrValue[controlName] = controlValue
+		controlsAttrValue = append(controlsAttrValue, controlValue)
 	}
 
-	controlsMap, controlsMapDiags := types.MapValue(
+	controlsSet, controlsSetDiags := types.SetValue(
 		types.ObjectType{AttrTypes: controlAttrTypes},
 		controlsAttrValue,
 	)
-	diags.Append(controlsMapDiags...)
+	diags.Append(controlsSetDiags...)
 
-	return controlsMap, diags
+	return controlsSet, diags
 }
 
-func convertSectionsMapToTerraformMap(ctx context.Context, sections map[string]SectionModel) (types.Map, diag.Diagnostics) {
+func convertSectionsMapToTerraformSet(ctx context.Context, sections map[string]SectionModel) (types.Set, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
-	sectionsAttrValue := make(map[string]attr.Value)
+	sectionsAttrValue := make([]attr.Value, 0, len(sections))
 	for sectionName, section := range sections {
-		sectionValue, sectionDiags := types.ObjectValueFrom(ctx, sectionAttrTypes, section)
+		// Add name to the section model for the set representation
+		sectionWithName := SectionModel{
+			ID:       section.ID,
+			Name:     types.StringValue(sectionName),
+			Controls: section.Controls,
+		}
+
+		sectionValue, sectionDiags := types.ObjectValueFrom(ctx, sectionAttrTypes, sectionWithName)
 		diags.Append(sectionDiags...)
 		if diags.HasError() {
 			continue
 		}
-		sectionsAttrValue[sectionName] = sectionValue
+		sectionsAttrValue = append(sectionsAttrValue, sectionValue)
 	}
 
-	sectionsMap, sectionsMapDiags := types.MapValue(
+	sectionsSet, sectionsSetDiags := types.SetValue(
 		types.ObjectType{AttrTypes: sectionAttrTypes},
 		sectionsAttrValue,
 	)
-	diags.Append(sectionsMapDiags...)
+	diags.Append(sectionsSetDiags...)
+
+	return sectionsSet, diags
+}
+
+// Helper functions to convert sets back to maps for internal processing
+
+func convertTerraformSetToControlsMap(ctx context.Context, controlsSet types.Set) (map[string]ControlModel, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	controlsMap := make(map[string]ControlModel)
+
+	if controlsSet.IsNull() || controlsSet.IsUnknown() {
+		return controlsMap, diags
+	}
+
+	var controls []ControlModel
+	diags.Append(controlsSet.ElementsAs(ctx, &controls, false)...)
+	if diags.HasError() {
+		return controlsMap, diags
+	}
+
+	for _, control := range controls {
+		// Use control ID as the key, fallback to name if ID is not available
+		key := control.ID.ValueString()
+		if key == "" {
+			key = control.Name.ValueString()
+		}
+		controlsMap[key] = control
+	}
+
+	return controlsMap, diags
+}
+
+func convertTerraformSetToSectionsMap(ctx context.Context, sectionsSet types.Set) (map[string]SectionModel, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	sectionsMap := make(map[string]SectionModel)
+
+	if sectionsSet.IsNull() || sectionsSet.IsUnknown() {
+		return sectionsMap, diags
+	}
+
+	var sections []SectionModel
+	diags.Append(sectionsSet.ElementsAs(ctx, &sections, false)...)
+	if diags.HasError() {
+		return sectionsMap, diags
+	}
+
+	for _, section := range sections {
+		sectionsMap[section.Name.ValueString()] = section
+	}
 
 	return sectionsMap, diags
 }
