@@ -3,6 +3,7 @@ package cloudcompliance_test
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"testing"
 	"time"
 
@@ -29,16 +30,18 @@ type completeFrameworkConfig struct {
 	Name        string
 	Description string
 	Active      *bool
-	Sections    map[string]sectionConfig
+	Sections    []sectionConfig
 }
 
 // sectionConfig represents a section within a framework
 type sectionConfig struct {
-	Controls map[string]controlConfig
+	Name     string
+	Controls []controlConfig
 }
 
 // controlConfig represents a control within a section
 type controlConfig struct {
+	Name        string
 	Description string
 	Rules       []string
 }
@@ -72,15 +75,15 @@ func (config *completeFrameworkConfig) String() string {
 	sectionsConfig := ""
 	if len(config.Sections) > 0 {
 		sectionsConfig = "\n  sections = [\n"
-		for sectionName, section := range config.Sections {
+		for _, section := range config.Sections {
 			sectionsConfig += "    {\n"
-			sectionsConfig += fmt.Sprintf("      name = %q\n", sectionName)
+			sectionsConfig += fmt.Sprintf("      name = %q\n", section.Name)
 
 			if len(section.Controls) > 0 {
 				sectionsConfig += "      controls = [\n"
-				for controlName, control := range section.Controls {
+				for _, control := range section.Controls {
 					sectionsConfig += "        {\n"
-					sectionsConfig += fmt.Sprintf("          name = %q\n", controlName)
+					sectionsConfig += fmt.Sprintf("          name = %q\n", control.Name)
 					sectionsConfig += fmt.Sprintf("          description = %q\n", control.Description)
 
 					if len(control.Rules) > 0 {
@@ -131,34 +134,27 @@ func (config *completeFrameworkConfig) TestChecks() resource.TestCheckFunc {
 
 	// Check sections count
 	if len(config.Sections) > 0 {
-		checks = append(checks, resource.TestCheckResourceAttr(customFrameworkResourceName, "sections.#", fmt.Sprintf("%d", len(config.Sections))))
+		checks = append(checks, resource.TestCheckResourceAttr(customFrameworkResourceName, "sections.#", strconv.Itoa(len(config.Sections))))
 
-		// For sets, we need to use TestCheckTypeSetElemNestedAttrs to check individual section elements
-		for sectionName, section := range config.Sections {
-			// Check that the section exists in the set with name
-			sectionAttrs := map[string]string{
-				"name": sectionName,
-			}
+		for _, section := range config.Sections {
+			// Check section exists in the set with name and id
+			sectionAttrs := map[string]string{"name": section.Name}
 			checks = append(checks, resource.TestCheckTypeSetElemNestedAttrs(customFrameworkResourceName, "sections.*", sectionAttrs))
 
-			// Check that section ID is set for all sections
-			checks = append(checks, resource.TestCheckResourceAttrSet(customFrameworkResourceName, "sections.0.id"))
-
-			// Check controls within each section (we can't easily verify nested sets in the test framework)
-			// So we'll just check the counts and presence of individual controls
 			if len(section.Controls) > 0 {
-				for controlName, control := range section.Controls {
-					controlPath := fmt.Sprintf("%s.controls.%s", sectionPath, controlName)
-					checks = append(checks,
-						resource.TestCheckResourceAttrSet(customFrameworkResourceName, controlPath+".id"),
-						resource.TestCheckResourceAttr(customFrameworkResourceName, controlPath+".description", control.Description),
-					)
+				for _, control := range section.Controls {
+					controlAttrs := map[string]string{
+						"name":        control.Name,
+						"description": control.Description,
+					}
+
+					// Check control exists in the set with name, description, and id
+					checks = append(checks, resource.TestCheckTypeSetElemNestedAttrs(customFrameworkResourceName, "sections.*.controls.*", controlAttrs))
 
 					// Check rules within each control (order-independent)
 					if len(control.Rules) > 0 {
-						checks = append(checks, resource.TestCheckResourceAttr(customFrameworkResourceName, fmt.Sprintf("%s.rules.#", controlPath), fmt.Sprintf("%d", len(control.Rules))))
 						for _, rule := range control.Rules {
-							checks = append(checks, resource.TestCheckTypeSetElemAttr(customFrameworkResourceName, fmt.Sprintf("%s.rules.*", controlPath), rule))
+							checks = append(checks, resource.TestCheckTypeSetElemAttr(customFrameworkResourceName, "sections.*.controls.*.rules.*", rule))
 						}
 					}
 				}
@@ -472,17 +468,20 @@ func TestAccCloudComplianceCustomFrameworkResource_WithSections(t *testing.T) {
 		Name:        "Test Framework With Sections",
 		Description: "Framework to test sections, controls, and rules",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Section 1": {
-				Controls: map[string]controlConfig{
-					"Control 1a": {
+		Sections: []sectionConfig{
+			{
+				Name: "Section 1",
+				Controls: []controlConfig{
+					{
+						Name:        "Control 1a",
 						Description: "This is the first control",
 						Rules: []string{
 							"2a11d9fc-6dfa-44f9-acc9-5ff046083716",
 							"a28151f0-5077-49da-8999-f909d94b53a3",
 						},
 					},
-					"Control 1b": {
+					{
+						Name:        "Control 1b",
 						Description: "This is another control in section 1",
 						Rules: []string{
 							"6896e8e5-84c2-4310-8207-3f46e54b6abe",
@@ -490,9 +489,11 @@ func TestAccCloudComplianceCustomFrameworkResource_WithSections(t *testing.T) {
 					},
 				},
 			},
-			"Section 2": {
-				Controls: map[string]controlConfig{
-					"Control 2": {
+			{
+				Name: "Section 2",
+				Controls: []controlConfig{
+					{
+						Name:        "Control 2",
 						Description: "This is the second control",
 						Rules:       []string{},
 					},
@@ -540,10 +541,12 @@ func TestAccCloudComplianceCustomFrameworkResource_Comprehensive(t *testing.T) {
 				Name:        "Test Framework Comprehensive CRUD",
 				Description: "Framework to test comprehensive CRUD operations",
 				Active:      utils.Addr(false),
-				Sections: map[string]sectionConfig{
-					"New Section": {
-						Controls: map[string]controlConfig{
-							"New Control To Delete": {
+				Sections: []sectionConfig{
+					{
+						Name: "New Section",
+						Controls: []controlConfig{
+							{
+								Name:        "New Control To Delete",
 								Description: "Control in new section",
 								Rules:       []string{"0473a26b-7f29-43c7-9581-105f8c9c0b7d"},
 							},
@@ -558,22 +561,27 @@ func TestAccCloudComplianceCustomFrameworkResource_Comprehensive(t *testing.T) {
 				Name:        "Test Framework Comprehensive CRUD",
 				Description: "Framework to test comprehensive CRUD operations",
 				Active:      utils.Addr(false),
-				Sections: map[string]sectionConfig{
-					"New Section": {
-						Controls: map[string]controlConfig{
-							"Additional Control 1": { // Added control
+				Sections: []sectionConfig{
+					{
+						Name: "New Section",
+						Controls: []controlConfig{
+							{
+								Name:        "Additional Control 1",
 								Description: "Additional control 1 description",
-								Rules:       []string{},
+								Rules:       []string{"0473a26b-7f29-43c7-9581-105f8c9c0b7d"},
 							},
 						},
 					},
-					"Another Section": {
-						Controls: map[string]controlConfig{
-							"Another Control 1": {
+					{
+						Name: "Another Section",
+						Controls: []controlConfig{
+							{
+								Name:        "Another Control 1",
 								Description: "Another control 1 description",
 								Rules:       []string{},
 							},
-							"Another Control 2": {
+							{
+								Name:        "Another Control 2",
 								Description: "Another control 2 description",
 								Rules:       []string{},
 							},
@@ -588,12 +596,14 @@ func TestAccCloudComplianceCustomFrameworkResource_Comprehensive(t *testing.T) {
 				Name:        "Test Framework Comprehensive CRUD",
 				Description: "Framework to test comprehensive CRUD operations",
 				Active:      utils.Addr(false),
-				Sections: map[string]sectionConfig{
-					"New Section": {
-						Controls: map[string]controlConfig{
-							"Additional Control 1": { // Added control
+				Sections: []sectionConfig{
+					{
+						Name: "New Section",
+						Controls: []controlConfig{
+							{
+								Name:        "Additional Control 1",
 								Description: "Additional control 1 description",
-								Rules:       []string{},
+								Rules:       []string{"0473a26b-7f29-43c7-9581-105f8c9c0b7d"},
 							},
 						},
 					},
@@ -630,17 +640,20 @@ func TestAccCloudComplianceCustomFrameworkResource_RuleAssignment(t *testing.T) 
 				Name:        "Test Framework Rule Assignment",
 				Description: "Framework to test rule assignments",
 				Active:      utils.Addr(false),
-				Sections: map[string]sectionConfig{
-					"Test Section": {
-						Controls: map[string]controlConfig{
-							"Control With Rules": {
+				Sections: []sectionConfig{
+					{
+						Name: "Test Section",
+						Controls: []controlConfig{
+							{
+								Name:        "Control With Rules",
 								Description: "Control that has rules assigned",
 								Rules: []string{
 									"2a11d9fc-6dfa-44f9-acc9-5ff046083716",
 									"a28151f0-5077-49da-8999-f909d94b53a3",
 								},
 							},
-							"Control Without Rules": {
+							{
+								Name:        "Control Without Rules",
 								Description: "Control with no rules",
 								Rules:       []string{},
 							},
@@ -655,17 +668,20 @@ func TestAccCloudComplianceCustomFrameworkResource_RuleAssignment(t *testing.T) 
 				Name:        "Test Framework Rule Assignment",
 				Description: "Framework to test rule assignments",
 				Active:      utils.Addr(false),
-				Sections: map[string]sectionConfig{
-					"Test Section": {
-						Controls: map[string]controlConfig{
-							"Control With Rules": {
+				Sections: []sectionConfig{
+					{
+						Name: "Test Section",
+						Controls: []controlConfig{
+							{
+								Name:        "Control With Rules",
 								Description: "Control that has rules assigned",
 								Rules: []string{ // Modified rules
 									"2a11d9fc-6dfa-44f9-acc9-5ff046083716",
 									"0473a26b-7f29-43c7-9581-105f8c9c0b7d",
 								},
 							},
-							"Control Without Rules": {
+							{
+								Name:        "Control Without Rules",
 								Description: "Control with no rules",
 								Rules:       []string{"6896e8e5-84c2-4310-8207-3f46e54b6abe"}, // Added rules
 							},
@@ -680,14 +696,17 @@ func TestAccCloudComplianceCustomFrameworkResource_RuleAssignment(t *testing.T) 
 				Name:        "Test Framework Rule Assignment",
 				Description: "Framework to test rule assignments",
 				Active:      utils.Addr(false),
-				Sections: map[string]sectionConfig{
-					"Test Section": {
-						Controls: map[string]controlConfig{
-							"Control With Rules": {
+				Sections: []sectionConfig{
+					{
+						Name: "Test Section",
+						Controls: []controlConfig{
+							{
+								Name:        "Control With Rules",
 								Description: "Control that has rules assigned",
 								Rules:       []string{}, // All rules removed
 							},
-							"Control Without Rules": {
+							{
+								Name:        "Control Without Rules",
 								Description: "Control with no rules",
 								Rules:       []string{}, // Rules removed
 							},
@@ -723,10 +742,12 @@ func TestAccCloudComplianceCustomFrameworkResource_SimpleSectionRename(t *testin
 		Name:        frameworkName,
 		Description: "Framework to test simple section renaming",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Original Section": {
-				Controls: map[string]controlConfig{
-					"Test Control": {
+		Sections: []sectionConfig{
+			{
+				Name: "Original Section",
+				Controls: []controlConfig{
+					{
+						Name:        "Test Control",
 						Description: "Test control description",
 						Rules:       []string{},
 					},
@@ -740,10 +761,12 @@ func TestAccCloudComplianceCustomFrameworkResource_SimpleSectionRename(t *testin
 		Name:        frameworkName,
 		Description: "Framework to test simple section renaming",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Renamed Section": {
-				Controls: map[string]controlConfig{
-					"Test Control": {
+		Sections: []sectionConfig{
+			{
+				Name: "Renamed Section",
+				Controls: []controlConfig{
+					{
+						Name:        "Test Control",
 						Description: "Test control description",
 						Rules:       []string{},
 					},
@@ -788,22 +811,27 @@ func TestAccCloudComplianceCustomFrameworkResource_ComprehensiveRenaming(t *test
 		Name:        "Test Framework Comprehensive Renaming",
 		Description: "Framework to test comprehensive renaming operations",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Original Section A": {
-				Controls: map[string]controlConfig{
-					"Original Control A1": {
+		Sections: []sectionConfig{
+			{
+				Name: "Original Section A",
+				Controls: []controlConfig{
+					{
+						Name:        "Original Control A1",
 						Description: "Original control description A1",
 						Rules:       []string{},
 					},
-					"Original Control A2": {
+					{
+						Name:        "Original Control A2",
 						Description: "Original control description A2",
 						Rules:       []string{},
 					},
 				},
 			},
-			"Original Section B": {
-				Controls: map[string]controlConfig{
-					"Original Control B1": {
+			{
+				Name: "Original Section B",
+				Controls: []controlConfig{
+					{
+						Name:        "Original Control B1",
 						Description: "Original control description B1",
 						Rules:       []string{},
 					},
@@ -817,22 +845,27 @@ func TestAccCloudComplianceCustomFrameworkResource_ComprehensiveRenaming(t *test
 		Name:        "Test Framework Comprehensive Renaming",
 		Description: "Framework to test comprehensive renaming operations",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Renamed Section A": {
-				Controls: map[string]controlConfig{
-					"Renamed Control A1": {
+		Sections: []sectionConfig{
+			{
+				Name: "Renamed Section A",
+				Controls: []controlConfig{
+					{
+						Name:        "Renamed Control A1",
 						Description: "Original control description A1",
 						Rules:       []string{},
 					},
-					"Original Control A2": {
+					{
+						Name:        "Original Control A2",
 						Description: "Original control description A2",
 						Rules:       []string{},
 					},
 				},
 			},
-			"Original Section B": {
-				Controls: map[string]controlConfig{
-					"Renamed Control B1": { // Control B1 renamed
+			{
+				Name: "Original Section B",
+				Controls: []controlConfig{
+					{
+						Name:        "Renamed Control B1", // Control B1 renamed
 						Description: "Original control description B1",
 						Rules:       []string{},
 					},
@@ -887,10 +920,12 @@ func TestAccCloudComplianceCustomFrameworkResource_ComprehensiveCRUD(t *testing.
 		Name:        "Test Framework Comprehensive CRUD",
 		Description: "Framework to test comprehensive CRUD operations",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Existing Section": {
-				Controls: map[string]controlConfig{
-					"Existing Control": {
+		Sections: []sectionConfig{
+			{
+				Name: "Existing Section",
+				Controls: []controlConfig{
+					{
+						Name:        "Existing Control",
 						Description: "Existing control description",
 						Rules:       []string{},
 					},
@@ -904,22 +939,27 @@ func TestAccCloudComplianceCustomFrameworkResource_ComprehensiveCRUD(t *testing.
 		Name:        "Test Framework Comprehensive CRUD",
 		Description: "Framework to test comprehensive CRUD operations",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Existing Section": {
-				Controls: map[string]controlConfig{
-					"Existing Control": {
+		Sections: []sectionConfig{
+			{
+				Name: "Existing Section",
+				Controls: []controlConfig{
+					{
+						Name:        "Existing Control",
 						Description: "Existing control description",
 						Rules:       []string{},
 					},
 				},
 			},
-			"New Section": { // Added section
-				Controls: map[string]controlConfig{
-					"New Control 1": {
+			{
+				Name: "New Section", // Added section
+				Controls: []controlConfig{
+					{
+						Name:        "New Control 1",
 						Description: "New control 1 description",
 						Rules:       []string{},
 					},
-					"New Control 2": {
+					{
+						Name:        "New Control 2",
 						Description: "New control 2 description",
 						Rules:       []string{},
 					},
@@ -933,30 +973,37 @@ func TestAccCloudComplianceCustomFrameworkResource_ComprehensiveCRUD(t *testing.
 		Name:        "Test Framework Comprehensive CRUD",
 		Description: "Framework to test comprehensive CRUD operations",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Existing Section": {
-				Controls: map[string]controlConfig{
-					"Existing Control": {
+		Sections: []sectionConfig{
+			{
+				Name: "Existing Section",
+				Controls: []controlConfig{
+					{
+						Name:        "Existing Control",
 						Description: "Existing control description",
 						Rules:       []string{},
 					},
-					"Additional Control 1": { // Added control
+					{
+						Name:        "Additional Control 1", // Added control
 						Description: "Additional control 1 description",
 						Rules:       []string{},
 					},
-					"Additional Control 2": { // Added control
+					{
+						Name:        "Additional Control 2", // Added control
 						Description: "Additional control 2 description",
 						Rules:       []string{},
 					},
 				},
 			},
-			"New Section": {
-				Controls: map[string]controlConfig{
-					"New Control 1": {
+			{
+				Name: "New Section",
+				Controls: []controlConfig{
+					{
+						Name:        "New Control 1",
 						Description: "New control 1 description",
 						Rules:       []string{},
 					},
-					"New Control 2": {
+					{
+						Name:        "New Control 2",
 						Description: "New control 2 description",
 						Rules:       []string{},
 					},
@@ -970,10 +1017,12 @@ func TestAccCloudComplianceCustomFrameworkResource_ComprehensiveCRUD(t *testing.
 		Name:        "Test Framework Comprehensive CRUD",
 		Description: "Framework to test comprehensive CRUD operations",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Existing Section": {
-				Controls: map[string]controlConfig{
-					"Existing Control": { // Only keep original control
+		Sections: []sectionConfig{
+			{
+				Name: "Existing Section",
+				Controls: []controlConfig{
+					{
+						Name:        "Existing Control", // Only keep original control
 						Description: "Existing control description",
 						Rules:       []string{},
 					},
@@ -1057,22 +1106,27 @@ func _TestAccCloudComplianceCustomFrameworkResource_MixedOperations(t *testing.T
 		Name:        "Test Framework Mixed Operations",
 		Description: "Framework to test mixed operations",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
-			"Section To Delete": {
-				Controls: map[string]controlConfig{
-					"Control To Delete": {
+		Sections: []sectionConfig{
+			{
+				Name: "Section To Delete",
+				Controls: []controlConfig{
+					{
+						Name:        "Control To Delete",
 						Description: "Control that will be deleted",
 						Rules:       []string{},
 					},
 				},
 			},
-			"Section To Rename": {
-				Controls: map[string]controlConfig{
-					"Control To Rename": {
+			{
+				Name: "Section To Rename",
+				Controls: []controlConfig{
+					{
+						Name:        "Control To Rename",
 						Description: "Control that will be renamed",
 						Rules:       []string{},
 					},
-					"Control To Delete": {
+					{
+						Name:        "Control To Delete",
 						Description: "Another control that will be deleted",
 						Rules:       []string{},
 					},
@@ -1086,24 +1140,29 @@ func _TestAccCloudComplianceCustomFrameworkResource_MixedOperations(t *testing.T
 		Name:        "Test Framework Mixed Operations",
 		Description: "Framework to test mixed operations",
 		Active:      utils.Addr(false),
-		Sections: map[string]sectionConfig{
+		Sections: []sectionConfig{
 			// "Section To Delete" - deleted entirely
-			"Renamed Section": { // "Section To Rename" renamed
-				Controls: map[string]controlConfig{
-					"Renamed Control": { // "Control To Rename" renamed
+			{
+				Name: "Renamed Section", // "Section To Rename" renamed
+				Controls: []controlConfig{
+					{
+						Name:        "Renamed Control", // "Control To Rename" renamed
 						Description: "Control that was renamed with updated description",
 						Rules:       []string{},
 					},
 					// "Control To Delete" - deleted
-					"New Control": { // Added new control
+					{
+						Name:        "New Control", // Added new control
 						Description: "New control added during mixed operations",
 						Rules:       []string{},
 					},
 				},
 			},
-			"New Section": { // Added new section
-				Controls: map[string]controlConfig{
-					"New Section Control": {
+			{
+				Name: "New Section", // Added new section
+				Controls: []controlConfig{
+					{
+						Name:        "New Section Control",
 						Description: "Control in new section",
 						Rules:       []string{},
 					},

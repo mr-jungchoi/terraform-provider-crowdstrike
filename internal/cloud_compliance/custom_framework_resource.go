@@ -431,17 +431,17 @@ func (r *cloudComplianceCustomFrameworkResource) Update(
 	// Handle sections/controls/rules updates using differential approach
 	// This preserves existing control IDs and only creates/updates/deletes as needed
 	if !plan.Sections.IsNull() && !plan.Sections.IsUnknown() {
-		planSections, planDiags := convertTerraformSetToSectionsMap(ctx, plan.Sections)
+		planSectionsByIdOrName, planDiags := convertTerraformSetToSectionsMap(ctx, plan.Sections)
 		resp.Diagnostics.Append(planDiags...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
 
 		// Get current state sections to compare
-		stateSections := make(map[string]SectionModel)
+		stateSectionsById := make(map[string]SectionModel)
 		if !state.Sections.IsNull() && !state.Sections.IsUnknown() {
 			var err diag.Diagnostics
-			stateSections, err = convertTerraformSetToSectionsMap(ctx, state.Sections)
+			stateSectionsById, err = convertTerraformSetToSectionsMap(ctx, state.Sections)
 			resp.Diagnostics.Append(err...)
 			if resp.Diagnostics.HasError() {
 				return
@@ -449,7 +449,7 @@ func (r *cloudComplianceCustomFrameworkResource) Update(
 		}
 
 		// Update controls differentially
-		updatedPlanSections, updateDiags := r.updateControlsForFramework(ctx, plan.ID.ValueString(), stateSections, planSections)
+		updatedPlanSections, updateDiags := r.updateControlsForFramework(ctx, plan.ID.ValueString(), stateSectionsById, planSectionsByIdOrName)
 		resp.Diagnostics.Append(updateDiags...)
 		if resp.Diagnostics.HasError() {
 			return
@@ -471,7 +471,7 @@ func (r *cloudComplianceCustomFrameworkResource) Update(
 
 	// Read back the controls to ensure state consistency only if sections are configured
 	if !plan.Sections.IsNull() && !plan.Sections.IsUnknown() {
-		sectionsSet, sectionsDiags := r.readControlsForFramework(ctx, *framework, &state)
+		sectionsSet, sectionsDiags := r.readControlsForFramework(ctx, *framework, &plan)
 		resp.Diagnostics.Append(sectionsDiags...)
 		if resp.Diagnostics.HasError() {
 			return
@@ -606,7 +606,7 @@ func (r *cloudComplianceCustomFrameworkResource) createControlsForFramework(
 
 		newControlsMap := make(map[string]ControlModel)
 		for controlName, control := range sectionControls {
-			createdControl, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionName, controlName, control)
+			createdControl, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionName, control)
 			diags.Append(createDiags...)
 			if diags.HasError() {
 				continue
@@ -633,14 +633,19 @@ func (r *cloudComplianceCustomFrameworkResource) createSingleControlAndReturn(
 	ctx context.Context,
 	frameworkID string,
 	sectionName string,
-	controlName string,
 	control ControlModel,
 ) (ControlModel, diag.Diagnostics) {
 	diags := diag.Diagnostics{}
 	emptyControl := ControlModel{}
+	controlName := control.Name.ValueString()
 
-	controlDesc := control.Description.ValueString()
-	params := buildCreateControlParams(ctx, frameworkID, sectionName, controlName, controlDesc)
+	params := buildCreateControlParams(
+		ctx,
+		frameworkID,
+		sectionName,
+		controlName,
+		control.Description.ValueString(),
+	)
 
 	createResp, err := r.client.CloudPolicies.CreateComplianceControl(params)
 	if err != nil {
@@ -678,7 +683,7 @@ func (r *cloudComplianceCustomFrameworkResource) createSingleControlAndReturn(
 		if assignRulesErr != nil {
 			diags.AddError(
 				"Error Assigning Rules",
-				fmt.Sprintf("Failed to assign rules to control %s: %s", controlName, falcon.ErrorExplain(assignRulesErr)),
+				fmt.Sprintf("Failed to assign rules to control %s: %s", *controlID, falcon.ErrorExplain(assignRulesErr)),
 			)
 			return emptyControl, diags
 		}
@@ -687,7 +692,7 @@ func (r *cloudComplianceCustomFrameworkResource) createSingleControlAndReturn(
 	// Return the control model with the new ID
 	return ControlModel{
 		ID:          types.StringValue(*controlID),
-		Name:        types.StringValue(controlName),
+		Name:        control.Name,
 		Description: control.Description,
 		Rules:       control.Rules,
 	}, diags
@@ -890,21 +895,21 @@ func (r *cloudComplianceCustomFrameworkResource) updateControlsForFramework(
 	var diags diag.Diagnostics
 
 	// Build existing controls map for lookup
-	existingControls, buildDiags := r.buildExistingControlsMap(ctx, stateSections)
+	existingControlsMap, buildDiags := r.buildExistingControlsMap(ctx, stateSections)
 	diags.Append(buildDiags...)
 	if diags.HasError() {
 		return types.SetNull(types.ObjectType{AttrTypes: sectionAttrTypes}), diags
 	}
 
 	// Process control updates
-	updatedSections, processDiags := r.processControlUpdates(ctx, frameworkID, existingControls, planSections)
+	updatedSections, processDiags := r.processControlUpdates(ctx, frameworkID, existingControlsMap, planSections)
 	diags.Append(processDiags...)
 	if diags.HasError() {
 		return types.SetNull(types.ObjectType{AttrTypes: sectionAttrTypes}), diags
 	}
 
 	// Delete controls that no longer exist in plan
-	deleteDiags := r.deleteRemovedControls(ctx, existingControls, planSections)
+	deleteDiags := r.deleteRemovedControls(ctx, existingControlsMap, planSections)
 	diags.Append(deleteDiags...)
 
 	// Convert to Terraform set
@@ -920,35 +925,35 @@ func (r *cloudComplianceCustomFrameworkResource) buildExistingControlsMap(
 	stateSections map[string]SectionModel,
 ) (map[string]map[string]ControlModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
-	existingControls := make(map[string]map[string]ControlModel)
+	existingControlsBySectionId := make(map[string]map[string]ControlModel)
 
-	for sectionName, section := range stateSections {
-		sectionControls, convertDiags := convertTerraformSetToControlsMap(ctx, section.Controls)
+	for sectionId, section := range stateSections {
+		sectionControlsById, convertDiags := convertTerraformSetToControlsMap(ctx, section.Controls)
 		diags.Append(convertDiags...)
 		if diags.HasError() {
 			continue
 		}
-		existingControls[sectionName] = sectionControls
+		existingControlsBySectionId[sectionId] = sectionControlsById
 	}
 
-	return existingControls, diags
+	return existingControlsBySectionId, diags
 }
 
 func (r *cloudComplianceCustomFrameworkResource) processControlUpdates(
 	ctx context.Context,
 	frameworkID string,
-	existingControls map[string]map[string]ControlModel,
-	planSections map[string]SectionModel,
+	existingControlsBySectionIdControlId map[string]map[string]ControlModel,
+	planSectionsByIdOrName map[string]SectionModel,
 ) (map[string]SectionModel, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	updatedSections := make(map[string]SectionModel)
 
 	// Build a map of all existing control IDs for efficient lookup
-	existingControlsByID := r.buildControlsByIDMap(existingControls)
+	existingControlsByID := r.buildControlsByIDMap(existingControlsBySectionIdControlId)
 
 	// Process each section in the plan
-	for sectionName, planSection := range planSections {
-		planControls, convertDiags := convertTerraformSetToControlsMap(ctx, planSection.Controls)
+	for sectionIdOrName, planSection := range planSectionsByIdOrName {
+		planControlsByIdOrName, convertDiags := convertTerraformSetToControlsMap(ctx, planSection.Controls)
 		diags.Append(convertDiags...)
 		if diags.HasError() {
 			continue
@@ -957,10 +962,10 @@ func (r *cloudComplianceCustomFrameworkResource) processControlUpdates(
 		updatedControls := make(map[string]ControlModel)
 
 		// Process each control in this section
-		for controlName, planControl := range planControls {
+		for controlIdOrName, planControl := range planControlsByIdOrName {
 			tflog.Debug(ctx, "PROCESS: Processing control", map[string]any{
-				"planSectionName":        sectionName,
-				"controlName":            controlName,
+				"planSectionName":        sectionIdOrName,
+				"controlIdOrName":        controlIdOrName,
 				"planControlID":          planControl.ID.ValueString(),
 				"planControlIDIsNull":    planControl.ID.IsNull(),
 				"planControlIDIsUnknown": planControl.ID.IsUnknown(),
@@ -975,46 +980,38 @@ func (r *cloudComplianceCustomFrameworkResource) processControlUpdates(
 
 				if existingControl, exists := existingControlsByID[controlID]; exists {
 					tflog.Debug(ctx, "PROCESS: Found existing control by ID", map[string]any{
-						"controlID":   controlID,
-						"controlName": controlName,
+						"controlID": controlID,
 					})
-					// Update existing control (handles renames and moves between sections)
-					updateDiags := r.updateExistingControl(
-						ctx, existingControl, planControl, controlName, sectionName,
-					)
+
+					updateDiags := r.updateExistingControl(ctx, existingControl, planControl)
 					diags.Append(updateDiags...)
 
 					// Update rules if necessary
 					if !existingControl.Rules.Equal(planControl.Rules) {
-						rulesDiags := r.updateControlRules(ctx, controlID, planControl, controlName)
+						rulesDiags := r.updateControlRules(ctx, planControl)
 						diags.Append(rulesDiags...)
 					}
 
 					// Use existing control with updated data
-					updatedControls[controlName] = ControlModel{
-						ID:          existingControl.ID,             // Keep existing ID
-						Name:        types.StringValue(controlName), // Use control name
-						Description: planControl.Description,        // Use plan description
-						Rules:       planControl.Rules,              // Use plan rules
+					updatedControls[controlID] = ControlModel{
+						ID:          existingControl.ID,      // Keep existing ID
+						Name:        planControl.Name,        // Use control name
+						Description: planControl.Description, // Use plan description
+						Rules:       planControl.Rules,       // Use plan rules
 					}
 					continue
 				}
-			} else {
-				tflog.Debug(ctx, "PROCESS: Plan control has no existing ID - will try to find existing control or create new", map[string]any{
-					"controlName": controlName,
-					"sectionName": sectionName,
-				})
 			}
 
 			// No existing control found, create new one
 			tflog.Debug(ctx, "PROCESS: Creating new control", map[string]any{
-				"controlName": controlName,
-				"sectionName": sectionName,
+				"controlName": planControl.Name.ValueString(),
+				"sectionName": sectionIdOrName,
 			})
-			createdControl, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionName, controlName, planControl)
+			createdControl, createDiags := r.createSingleControlAndReturn(ctx, frameworkID, sectionIdOrName, planControl)
 			diags.Append(createDiags...)
 			if !diags.HasError() {
-				updatedControls[controlName] = createdControl
+				updatedControls[createdControl.ID.ValueString()] = createdControl
 			}
 		}
 
@@ -1025,8 +1022,9 @@ func (r *cloudComplianceCustomFrameworkResource) processControlUpdates(
 			continue
 		}
 
-		updatedSections[sectionName] = SectionModel{
-			Name:     types.StringValue(sectionName),
+		updatedSections[sectionIdOrName] = SectionModel{
+			ID:       planSection.ID, // Preserve section ID from plan
+			Name:     planSection.Name,
 			Controls: controlsSet,
 		}
 	}
@@ -1054,11 +1052,11 @@ func (r *cloudComplianceCustomFrameworkResource) buildControlsByIDMap(
 func (r *cloudComplianceCustomFrameworkResource) updateExistingControl(
 	ctx context.Context,
 	existingControl, planControl ControlModel,
-	controlName, sectionName string,
 ) diag.Diagnostics {
 	var diags diag.Diagnostics
 
 	controlID := existingControl.ID.ValueString()
+	controlName := planControl.Name.ValueString()
 	//controlDesc := planControl.Description.ValueString()
 	updateReq := &models.CommonUpdateComplianceControlRequest{
 		Name: &controlName,
@@ -1072,7 +1070,7 @@ func (r *cloudComplianceCustomFrameworkResource) updateExistingControl(
 	_, err := r.client.CloudPolicies.UpdateComplianceControl(updateParams)
 	if err != nil {
 		diags.AddError(errorUpdatingControl,
-			fmt.Sprintf("Failed to update control %s in section %s: %s", controlName, sectionName, falcon.ErrorExplain(err)))
+			fmt.Sprintf("Failed to update control %s: %s", controlID, falcon.ErrorExplain(err)))
 	}
 
 	return diags
@@ -1080,9 +1078,7 @@ func (r *cloudComplianceCustomFrameworkResource) updateExistingControl(
 
 func (r *cloudComplianceCustomFrameworkResource) updateControlRules(
 	ctx context.Context,
-	controlID string,
 	planControl ControlModel,
-	controlName string,
 ) diag.Diagnostics {
 	var diags diag.Diagnostics
 
@@ -1100,13 +1096,13 @@ func (r *cloudComplianceCustomFrameworkResource) updateControlRules(
 	}
 
 	assignParams := cloud_policies.NewReplaceControlRulesParamsWithContext(ctx).
-		WithUID(controlID).
+		WithUID(planControl.ID.ValueString()).
 		WithBody(assignReq)
 
 	_, assignRulesErr := r.client.CloudPolicies.ReplaceControlRules(assignParams)
 	if assignRulesErr != nil {
 		diags.AddError(errorAssigningRules,
-			fmt.Sprintf("Failed to assign rules to control %s: %s", controlName, falcon.ErrorExplain(assignRulesErr)))
+			fmt.Sprintf("Failed to assign rules to control %s: %s", planControl.ID.ValueString(), falcon.ErrorExplain(assignRulesErr)))
 	}
 
 	return diags

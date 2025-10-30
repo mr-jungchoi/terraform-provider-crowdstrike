@@ -226,6 +226,11 @@ func convertTerraformSetToSectionsMap(ctx context.Context, sectionsSet types.Set
 	}
 
 	for _, section := range sections {
+		// Use control ID as the key, fallback to name if ID is not available
+		key := section.ID.ValueString()
+		if key == "" {
+			key = section.Name.ValueString()
+		}
 		sectionsMap[section.Name.ValueString()] = section
 	}
 
